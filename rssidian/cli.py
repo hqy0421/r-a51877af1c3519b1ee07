@@ -123,27 +123,50 @@ def opml_import(ctx, opml_file, force):
         console.print(f"Found [bold]{len(feeds_data)}[/bold] feeds in OPML file.")
         
         # Import the feeds
-        new_count, updated_count = import_feeds_from_opml(opml_file, db_session)
-        
+        result = import_feeds_from_opml(opml_file, db_session)
+
         # Show summary
         summary_table = Table(show_header=False, box=box.SIMPLE)
         summary_table.add_column("Statistic", style="cyan")
         summary_table.add_column("Value")
-        
-        if new_count > 0 or updated_count > 0:
-            summary_table.add_row("New feeds", f"[green]{new_count}[/green]")
-            summary_table.add_row("Updated feeds", f"[yellow]{updated_count}[/yellow]")
+
+        if result["new"] > 0 or result["updated"] > 0 or result["relocated"] > 0:
+            summary_table.add_row("New feeds", f"[green]{result['new']}[/green]")
+            summary_table.add_row("Updated feeds", f"[yellow]{result['updated']}[/yellow]")
+            summary_table.add_row("Relocated feeds", f"[magenta]{result['relocated']}[/magenta]")
+            if result["skipped"] > 0:
+                summary_table.add_row("Skipped (already moved)", f"[dim]{result['skipped']}[/dim]")
+            if result["errors"] > 0:
+                summary_table.add_row("Errors", f"[red]{result['errors']}[/red]")
             console.print(Panel.fit(
-                "[bold green]Import Successful[/bold green]", 
+                "[bold green]Import Successful[/bold green]",
                 border_style="green"
             ))
         else:
             console.print("[yellow]No new feeds were imported.[/yellow]")
-        
+            if result["skipped"] > 0:
+                summary_table.add_row("Skipped (already moved)", f"[dim]{result['skipped']}[/dim]")
+            if result["errors"] > 0:
+                summary_table.add_row("Errors", f"[red]{result['errors']}[/red]")
+
+        # Detail every relocation so address changes are never silent
+        if result["relocations"]:
+            reloc_table = Table(title="Feed relocations registered", box=box.SIMPLE)
+            reloc_table.add_column("Feed", style="bold")
+            reloc_table.add_column("Old URL", style="dim")
+            reloc_table.add_column("New URL", style="green")
+            for reloc in result["relocations"]:
+                reloc_table.add_row(reloc["title"], reloc["old_url"], reloc["new_url"])
+            console.print(reloc_table)
+            console.print(
+                "[dim]History, articles and read progress were preserved on the existing "
+                "subscriptions. Use 'subscriptions rollback <title>' to revert a move.[/dim]"
+            )
+
         # Show total feeds in database
         total_feeds = db_session.query(Feed).count()
         summary_table.add_row("Total feeds in database", f"[bold]{total_feeds}[/bold]")
-        
+
         console.print(summary_table)
         
     except Exception as e:
@@ -388,6 +411,8 @@ def list_subscriptions(ctx, sort, width):
             status_parts.append("[dim italic]MUTED[/dim italic]")
         if feed.peer_through:
             status_parts.append("[green]PT[/green]")
+        if feed.previous_url:
+            status_parts.append("[cyan]MOVED[/cyan]")
         status = " ".join(status_parts) if status_parts else ""
         
         # Prepare rating display
@@ -568,6 +593,104 @@ def disable_peer_through(ctx, feed_title):
     db_session.close()
 
 
+@subscriptions.command("relocate")
+@click.argument("feed_title")
+@click.argument("new_url")
+@click.option("--reason", default=None, help="Reason for the move (recorded in the URL history)")
+@click.pass_context
+def relocate_subscription(ctx, feed_title, new_url, reason):
+    """Register a feed's move to a new address, preserving its history.
+
+    The subscription keeps its Feed ID, all ingested articles and read
+    progress; only the fetch URL changes. The old address is remembered
+    as a fetch fallback and can be restored with 'subscriptions rollback'.
+    """
+    config = ctx.obj["config"]
+    db_session = ensure_db_exists(config)
+
+    # Import modules here
+    from .models import Feed, Article
+    from .relocation import relocate_feed
+
+    # Find feed by title
+    feed = db_session.query(Feed).filter(Feed.title.like(f"%{feed_title}%")).first()
+
+    if not feed:
+        click.echo(f"No feed found matching title: {feed_title}", err=True)
+        db_session.close()
+        return
+
+    try:
+        old_url = feed.url
+        if not relocate_feed(db_session, feed, new_url, source="manual", reason=reason):
+            console.print(f"[yellow]Feed is already at that address:[/yellow] {feed.url}")
+            db_session.close()
+            return
+        db_session.commit()
+    except ValueError as e:
+        db_session.rollback()
+        console.print(f"[bold red]Cannot relocate feed:[/bold red] {e}")
+        db_session.close()
+        return
+
+    article_count = db_session.query(Article).filter_by(feed_id=feed.id).count()
+    console.print(Panel.fit(
+        f"[bold green]Feed Relocated[/bold green]\n\n"
+        f"Feed: {feed.title} (id={feed.id})\n"
+        f"Old URL: {old_url}\n"
+        f"New URL: {feed.url}\n"
+        f"Articles preserved: {article_count}\n\n"
+        f"[dim]If the new address serves no data, ingestion falls back to the old\n"
+        f"one for this batch. Revert anytime: subscriptions rollback \"{feed.title}\"[/dim]",
+        border_style="green"
+    ))
+    db_session.close()
+
+
+@subscriptions.command("rollback")
+@click.argument("feed_title")
+@click.pass_context
+def rollback_subscription(ctx, feed_title):
+    """Roll back the most recent URL relocation for a feed.
+
+    Restores the previous address on the same Feed record, so articles
+    and read progress stay attached. Repeated rollbacks unwind multiple
+    relocations in reverse order.
+    """
+    config = ctx.obj["config"]
+    db_session = ensure_db_exists(config)
+
+    # Import modules here
+    from .models import Feed
+    from .relocation import rollback_feed_relocation
+
+    # Find feed by title
+    feed = db_session.query(Feed).filter(Feed.title.like(f"%{feed_title}%")).first()
+
+    if not feed:
+        click.echo(f"No feed found matching title: {feed_title}", err=True)
+        db_session.close()
+        return
+
+    abandoned_url = feed.url
+    restored_url = rollback_feed_relocation(db_session, feed)
+
+    if restored_url is None:
+        console.print(f"[yellow]Nothing to roll back:[/yellow] {feed.title} has no recorded relocation.")
+        db_session.close()
+        return
+
+    db_session.commit()
+    console.print(Panel.fit(
+        f"[bold green]Relocation Rolled Back[/bold green]\n\n"
+        f"Feed: {feed.title} (id={feed.id})\n"
+        f"Abandoned URL: {abandoned_url}\n"
+        f"Restored URL: {restored_url}",
+        border_style="green"
+    ))
+    db_session.close()
+
+
 @cli.command()
 @click.option("--lookback", type=int, help="Number of days to look back for articles")
 @click.option("--debug/--no-debug", default=False, help="Enable debug output")
@@ -601,6 +724,17 @@ def ingest(ctx, lookback, debug):
         # Display information about auto-muted feeds if any
         if 'auto_muted' in result and result['auto_muted'] > 0:
             click.echo(f"Auto-muted {result['auto_muted']} feeds due to persistent errors. Use 'subscriptions list' to see details.")
+
+        # Surface relocated feeds whose previous address won the batch
+        if result.get('fallback_fetches'):
+            click.echo(
+                f"{result['fallback_fetches']} feed(s) served data from their PREVIOUS address "
+                f"this batch: {', '.join(result['fallback_feeds'])}"
+            )
+            click.echo(
+                "  Their registered new address served nothing. If the move was premature, "
+                "run 'subscriptions rollback <title>'; otherwise no action is needed."
+            )
         
         # Step 2: Process fetched articles (summary, value analysis, embeddings)
         if result['new_articles'] > 0:

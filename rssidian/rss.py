@@ -503,10 +503,10 @@ def process_feed(
     retry_attempts: int = 3,  # Number of retry attempts for transient errors
     config: Optional[Config] = None,  # Configuration for article analysis
     analyze_content: bool = True  # Whether to analyze content during ingestion
-) -> Tuple[int, int, int, int]:
+) -> Tuple[int, int, int, int, Optional[str]]:
     """
     Process a feed, fetch new articles and store them in the database.
-    
+
     Args:
         feed: Feed object
         db_session: SQLAlchemy database session
@@ -517,40 +517,66 @@ def process_feed(
         retry_attempts: Number of retry attempts for transient errors
         config: Configuration for article analysis
         analyze_content: Whether to analyze content during ingestion
-        
+
     Returns:
-        Tuple of (new_articles, jina_enhanced, with_summary, with_value_analysis)
+        Tuple of (new_articles, jina_enhanced, with_summary, with_value_analysis,
+        source_url) where source_url is the address that actually served the
+        entries this batch (the feed's previous URL if it had to fall back),
+        or None if no address served any entries.
     """
     if feed.muted:
         if progress_callback:
             progress_callback(f"Skipping muted feed: {feed.title}")
-        return 0, 0, 0, 0
-    
+        return 0, 0, 0, 0, None
+
     if progress_callback:
         progress_callback(f"Processing feed: {feed.title}")
-    
+
     # Always update the last checked timestamp
     feed.last_checked = datetime.utcnow()
-    
+
     try:
         # Get feed entries with retry logic
         entries = get_feed_entries(feed.url, lookback_days, max_retries=retry_attempts)
-        
+        source_url = feed.url if entries else None
+
+        # Availability conflict after a relocation: the new address serves
+        # nothing but the previous one may still be live. Try it in the same
+        # batch and record which address actually delivered data.
+        if not entries and feed.previous_url:
+            logger.info(
+                f"Feed '{feed.title}': no entries from new URL {feed.url}, "
+                f"trying previous URL {feed.previous_url}"
+            )
+            fallback_entries = get_feed_entries(
+                feed.previous_url, lookback_days, max_retries=retry_attempts
+            )
+            if fallback_entries:
+                entries = fallback_entries
+                source_url = feed.previous_url
+                logger.warning(
+                    f"Feed '{feed.title}': new URL {feed.url} served no data this batch; "
+                    f"previous URL {feed.previous_url} is still serving. "
+                    f"If the move was premature, run: subscriptions rollback \"{feed.title}\""
+                )
+
         # If no entries were found, this might be a temporary issue or a feed that rarely updates
         if not entries:
             # Only increment error count for HTTP errors (which would be logged as errors)
             # Don't increment for feeds that simply have no new entries
             feed.no_entries_count = getattr(feed, 'no_entries_count', 0) + 1
-            
+
             # If we consistently find no entries for a long time, log a warning
             if feed.no_entries_count > 5:  # After 5 consecutive checks with no entries
                 logger.warning(f"Feed {feed.title} has had no entries for {feed.no_entries_count} consecutive checks")
-            
+
             db_session.commit()
-            return 0, 0, 0, 0
-        
+            return 0, 0, 0, 0, None
+
         # Reset no entries counter if we found entries
         feed.no_entries_count = 0
+        # Record which address actually served data this batch
+        feed.last_successful_url = source_url
         
         # Sort entries by date if possible, newest first
         sorted_entries = []
@@ -715,22 +741,22 @@ def process_feed(
         feed.last_error = None
         
         db_session.commit()
-        return new_article_count, jina_enhanced_count, with_summary_count, with_value_count
-    
+        return new_article_count, jina_enhanced_count, with_summary_count, with_value_count, source_url
+
     except Exception as e:
         logger.error(f"Error processing feed {feed.title}: {str(e)}")
         # Update error information
         feed.error_count = getattr(feed, 'error_count', 0) + 1
         feed.last_error = str(e)
-        
+
         # Check if we should mark the feed as inactive due to too many errors
         if feed.error_count >= max_errors:
             logger.warning(f"Feed {feed.title} has had {feed.error_count} consecutive errors. Marking as muted.")
             feed.muted = True
             feed.muted_reason = f"Auto-muted after {feed.error_count} consecutive errors. Last error: {feed.last_error}"
-        
+
         db_session.commit()
-        return 0, 0, 0, 0
+        return 0, 0, 0, 0, None
 
 
 def process_all_feeds(
@@ -758,23 +784,26 @@ def process_all_feeds(
         Dictionary with processing statistics
     """
     feeds = db_session.query(Feed).filter_by(muted=False).all()
-    
+
     if not feeds:
         logger.warning("No active feeds found in database")
         return {
-            "feeds_processed": 0, 
-            "new_articles": 0, 
+            "feeds_processed": 0,
+            "new_articles": 0,
             "auto_muted": 0,
             "jina_enhanced": 0,
             "with_summary": 0,
-            "with_value_analysis": 0
+            "with_value_analysis": 0,
+            "fallback_fetches": 0,
+            "fallback_feeds": []
         }
-    
+
     total_new_articles = 0
     auto_muted_count = 0
     total_jina_enhanced = 0
     total_with_summary = 0
     total_with_value = 0
+    fallback_feeds = []
     # Create a beautiful Rich progress bar
     with Progress(
         SpinnerColumn(),
@@ -805,9 +834,9 @@ def process_all_feeds(
                 progress.update(main_task, description=f"[bold blue]{msg[:40]}")
             
             # Process the feed
-            new_articles, jina_enhanced, with_summary, with_value = process_feed(
+            new_articles, jina_enhanced, with_summary, with_value, source_url = process_feed(
                 feed,
-                db_session, 
+                db_session,
                 lookback_days=lookback_days,
                 max_articles=max_articles_per_feed,
                 progress_callback=update_progress,
@@ -816,12 +845,24 @@ def process_all_feeds(
                 config=config,
                 analyze_content=analyze_content
             )
-            
+
+            # A relocated feed whose previous URL still serves data is an
+            # availability conflict: make explicit which address delivered
+            fetched_via_fallback = (
+                source_url is not None
+                and feed.previous_url
+                and source_url == feed.previous_url
+            )
+            if fetched_via_fallback:
+                fallback_feeds.append(feed.title)
+
             # Calculate processing time
             feed_duration = time.time() - feed_start_time
-            
+
             # Update stats field with colorful information
             stats_text = f"[green]new:[/green] {new_articles} [yellow]jina:[/yellow] {jina_enhanced} [blue]summary:[/blue] {with_summary} [magenta]value:[/magenta] {with_value} [cyan]time:[/cyan] {feed_duration:.1f}s"
+            if fetched_via_fallback:
+                stats_text += " [red]via previous URL[/red]"
             progress.update(main_task, stats=stats_text)
             
             # Advance the progress
@@ -838,12 +879,21 @@ def process_all_feeds(
     # Log summary of auto-muted feeds
     if auto_muted_count > 0:
         logger.warning(f"Auto-muted {auto_muted_count} feeds due to persistent errors")
-    
+
+    # Log summary of feeds that fell back to their previous URL
+    if fallback_feeds:
+        logger.warning(
+            f"{len(fallback_feeds)} feed(s) served data from their PREVIOUS URL this batch: "
+            f"{', '.join(fallback_feeds)}"
+        )
+
     return {
         "feeds_processed": len(feeds),
         "new_articles": total_new_articles,
         "auto_muted": auto_muted_count,
         "jina_enhanced": total_jina_enhanced,
         "with_summary": total_with_summary,
-        "with_value_analysis": total_with_value
+        "with_value_analysis": total_with_value,
+        "fallback_fetches": len(fallback_feeds),
+        "fallback_feeds": fallback_feeds
     }

@@ -50,7 +50,10 @@ class ModelContextProtocol:
                 "last_updated": feed.last_updated.isoformat() if feed.last_updated else None,
                 "muted": feed.muted,
                 "peer_through": feed.peer_through,
-                "article_count": feed.article_count
+                "article_count": feed.article_count,
+                "previous_url": feed.previous_url,
+                "url_updated_at": feed.url_updated_at.isoformat() if feed.url_updated_at else None,
+                "last_successful_url": feed.last_successful_url
             })
         
         return result

@@ -85,7 +85,9 @@ class RSSProcessor:
                 "auto_muted": 0,
                 "jina_enhanced": 0,
                 "with_summary": 0,
-                "with_value_analysis": 0
+                "with_value_analysis": 0,
+                "fallback_fetches": 0,
+                "fallback_feeds": []
             }
 
     def _call_openrouter_api(self, prompt: str, model: Optional[str] = None) -> Optional[str]:

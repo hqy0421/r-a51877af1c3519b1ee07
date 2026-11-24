@@ -183,6 +183,10 @@ rssidian subscriptions list --sort=updated                 # List all subscripti
 rssidian subscriptions mute "Feed Title"                   # Mute a feed (skip during ingestion)
 rssidian subscriptions unmute "Feed Title"                 # Unmute a feed
 
+# Feed relocation (when a feed moves to a new address)
+rssidian subscriptions relocate "Feed Title" <new_url>     # Register the move, keeping Feed ID, articles and read progress
+rssidian subscriptions rollback "Feed Title"               # Revert the most recent relocation
+
 # Process new articles (last 7 days by default)
 rssidian ingest
 
@@ -252,6 +256,13 @@ This will display:
 - Exports feeds to OPML file (with option to include/exclude muted feeds)
 - Stores subscription data in SQLite database
 - Enables muting/unmuting of specific feeds
+- Tracks feed relocations: when an OPML import presents a known feed at a new
+  address, the move is registered on the existing subscription (same Feed ID,
+  articles and read progress preserved) instead of creating a disconnected
+  duplicate. Stale OPML entries for already-moved addresses are skipped.
+  Relocations can be rolled back, and while both old and new addresses are
+  reachable, ingestion reports per batch which address actually served data
+  (`last_successful_url`, fallback notice in `ingest` output).
 
 ### Content Processing:
 - Fetches articles from RSS feeds

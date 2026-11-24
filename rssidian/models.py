@@ -25,6 +25,15 @@ class Feed(Base):
     error_count = Column(Integer, default=0)  # Count of consecutive errors
     no_entries_count = Column(Integer, default=0)  # Count of consecutive checks with no entries
     last_error = Column(Text, nullable=True)
+
+    # Relocation tracking: when a feed moves to a new address, the URL is
+    # updated in place so the Feed ID, article associations and read/processing
+    # progress survive. The old address is kept for rollback and as a fetch
+    # fallback while both addresses are reachable.
+    previous_url = Column(String(512), nullable=True)  # URL relocated from (fallback candidate)
+    url_updated_at = Column(DateTime, nullable=True)  # When the current URL became effective
+    url_history = Column(Text, nullable=True)  # JSON list of relocation/rollback events
+    last_successful_url = Column(String(512), nullable=True)  # Address that actually served data last batch
     
     # Statistics
     article_count = Column(Integer, default=0)  # Total count of ingested articles
@@ -70,19 +79,45 @@ class Article(Base):
         return f"<Article(id={self.id}, title='{self.title[:30]}...', quality_tier='{self.quality_tier or 'None'}')>"
 
 
+def _migrate_schema(engine) -> None:
+    """Add columns introduced after the initial schema to existing databases.
+
+    New databases get every column from Base.metadata.create_all(); this
+    upgrades databases created by older versions in place.
+    """
+    from sqlalchemy import inspect, text
+
+    inspector = inspect(engine)
+
+    # Columns added per table: {table: {column: SQL type}}
+    migrations = {
+        "articles": {
+            "embedding_vector": "TEXT",
+        },
+        "feeds": {
+            "previous_url": "VARCHAR(512)",
+            "url_updated_at": "DATETIME",
+            "url_history": "TEXT",
+            "last_successful_url": "VARCHAR(512)",
+        },
+    }
+
+    with engine.connect() as conn:
+        for table, columns in migrations.items():
+            if not inspector.has_table(table):
+                continue
+            existing = {col["name"] for col in inspector.get_columns(table)}
+            for column, ddl in columns.items():
+                if column not in existing:
+                    conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}"))
+        conn.commit()
+
+
 def init_db(db_path: str) -> Session:
     """Initialize database and return session."""
     engine = create_engine(f"sqlite:///{db_path}")
     Base.metadata.create_all(engine)
-
-    # Migrate: add embedding_vector column if missing (existing databases)
-    from sqlalchemy import inspect, text
-    inspector = inspect(engine)
-    columns = [col["name"] for col in inspector.get_columns("articles")]
-    if "embedding_vector" not in columns:
-        with engine.connect() as conn:
-            conn.execute(text("ALTER TABLE articles ADD COLUMN embedding_vector TEXT"))
-            conn.commit()
+    _migrate_schema(engine)
 
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     return SessionLocal()
@@ -91,15 +126,7 @@ def init_db(db_path: str) -> Session:
 def get_db_session(db_path: str) -> Session:
     """Get a database session."""
     engine = create_engine(f"sqlite:///{db_path}")
-
-    # Migrate: add embedding_vector column if missing (existing databases)
-    from sqlalchemy import inspect, text
-    inspector = inspect(engine)
-    columns = [col["name"] for col in inspector.get_columns("articles")]
-    if "embedding_vector" not in columns:
-        with engine.connect() as conn:
-            conn.execute(text("ALTER TABLE articles ADD COLUMN embedding_vector TEXT"))
-            conn.commit()
+    _migrate_schema(engine)
 
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     return SessionLocal()

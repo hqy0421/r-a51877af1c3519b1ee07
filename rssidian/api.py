@@ -20,6 +20,9 @@ class FeedResponse(BaseModel):
     last_updated: Optional[str] = None
     muted: bool
     peer_through: bool
+    previous_url: Optional[str] = None
+    url_updated_at: Optional[str] = None
+    last_successful_url: Optional[str] = None
 
 
 class ArticleResponse(BaseModel):
@@ -168,9 +171,12 @@ def create_api(config: Config) -> FastAPI:
                 "website_url": feed.website_url,
                 "last_updated": feed.last_updated.isoformat() if feed.last_updated else None,
                 "muted": feed.muted,
-                "peer_through": feed.peer_through
+                "peer_through": feed.peer_through,
+                "previous_url": feed.previous_url,
+                "url_updated_at": feed.url_updated_at.isoformat() if feed.url_updated_at else None,
+                "last_successful_url": feed.last_successful_url
             })
-        
+
         return response
     
     # Mute subscription

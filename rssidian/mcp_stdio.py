@@ -97,6 +97,10 @@ def format_subscriptions_response(subscriptions: List[Dict]) -> str:
     for i, feed in enumerate(subscriptions):
         result += f"{i+1}. {feed['title']}\n"
         result += f"   URL: {feed['url']}\n"
+        if feed.get('previous_url'):
+            result += f"   Relocated From: {feed['previous_url']}\n"
+        if feed.get('last_successful_url') and feed['last_successful_url'] != feed['url']:
+            result += f"   Last Served Data From: {feed['last_successful_url']}\n"
         if feed.get('description'):
             result += f"   Description: {feed['description'][:150]}{'...' if len(feed['description']) > 150 else ''}\n"
         result += f"   Articles: {feed['article_count']}\n"

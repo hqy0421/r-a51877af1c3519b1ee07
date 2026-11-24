@@ -1,11 +1,17 @@
 import os
 import xml.etree.ElementTree as ET
 import xml.dom.minidom
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any
 from datetime import datetime
 from sqlalchemy.orm import Session
 
 from .models import Feed
+from .relocation import (
+    find_relocation_candidate,
+    get_url_history,
+    normalize_feed_url,
+    relocate_feed,
+)
 
 
 def parse_opml(file_path: str) -> List[Dict[str, Any]]:
@@ -43,58 +49,151 @@ def parse_opml(file_path: str) -> List[Dict[str, Any]]:
         raise ValueError(f"Invalid OPML file: {e}")
 
 
-def import_feeds_from_opml(file_path: str, db_session: Session) -> Tuple[int, int]:
+def import_feeds_from_opml(file_path: str, db_session: Session) -> Dict[str, Any]:
     """
     Import feeds from an OPML file into the database.
-    
+
+    Feeds are matched to existing subscriptions in this order:
+
+    1. Same URL (exact or cosmetically different) -> update in place. A
+       cosmetic URL change (http->https, www, trailing slash) is registered
+       as a relocation so the address history stays complete.
+    2. URL known from a feed's relocation history -> the OPML is stale for
+       this entry; skip it instead of creating a duplicate subscription.
+    3. Same website URL or unique same title but an unseen URL -> the feed
+       moved; register a relocation on the existing Feed row so its ID,
+       articles and read progress carry over.
+    4. Otherwise -> create a new feed.
+
     Args:
         file_path: Path to the OPML file
         db_session: SQLAlchemy database session
-        
+
     Returns:
-        Tuple of (new_feeds_count, updated_feeds_count)
+        Dict with counts (new, updated, relocated, skipped, errors) and a
+        "relocations" list of {feed_id, title, old_url, new_url} details
     """
     feeds_data = parse_opml(file_path)
-    
-    new_count = 0
-    updated_count = 0
-    error_count = 0
-    
+
+    stats = {"new": 0, "updated": 0, "relocated": 0, "skipped": 0, "errors": 0}
+    relocations: List[Dict[str, Any]] = []
+
+    # Index existing feeds once; updated as feeds are relocated/created.
+    all_feeds: List[Feed] = db_session.query(Feed).all()
+    by_current_url: Dict[str, Feed] = {}
+    by_historical_url: Dict[str, Feed] = {}
+    for feed in all_feeds:
+        by_current_url.setdefault(normalize_feed_url(feed.url), feed)
+        for event in get_url_history(feed):
+            by_historical_url.setdefault(normalize_feed_url(event.get("old_url")), feed)
+            by_historical_url.setdefault(normalize_feed_url(event.get("new_url")), feed)
+
+    def register_current(feed: Feed, url: str) -> None:
+        by_current_url[normalize_feed_url(url)] = feed
+        by_historical_url.setdefault(normalize_feed_url(url), feed)
+
+    def retire_current(feed: Feed, url: str) -> None:
+        """Move a URL from the current index to the historical one."""
+        key = normalize_feed_url(url)
+        if by_current_url.get(key) is feed:
+            del by_current_url[key]
+        by_historical_url.setdefault(key, feed)
+
+    def known_urls_of(feed: Feed) -> set:
+        """Exact URLs this feed currently uses or ever moved away from."""
+        urls = {feed.url}
+        for event in get_url_history(feed):
+            urls.add(event.get("old_url"))
+            urls.add(event.get("new_url"))
+        return urls
+
+    def apply_relocation(feed: Feed, new_url: str, old_url: str) -> None:
+        retire_current(feed, old_url)
+        register_current(feed, new_url)
+        stats["relocated"] += 1
+        relocations.append({
+            "feed_id": feed.id,
+            "title": feed.title,
+            "old_url": old_url,
+            "new_url": new_url,
+        })
+
     for feed_data in feeds_data:
         try:
-            # Check if feed already exists - use get() to avoid potential session issues
-            existing_feed = db_session.query(Feed).filter_by(url=feed_data["url"]).one_or_none()
-            
-            if existing_feed:
-                # Update existing feed
+            url = (feed_data["url"] or "").strip()
+            normalized = normalize_feed_url(url)
+
+            existing_feed = by_current_url.get(normalized)
+
+            if existing_feed and existing_feed.url == url:
+                # 1. Exact match: refresh metadata only
                 existing_feed.title = feed_data["title"]
                 existing_feed.description = feed_data["description"]
                 existing_feed.website_url = feed_data["website_url"]
-                updated_count += 1
-                # Commit each update individually to avoid transaction conflicts
+                stats["updated"] += 1
                 db_session.commit()
-            else:
-                # Create new feed
-                new_feed = Feed(
-                    title=feed_data["title"],
-                    url=feed_data["url"],
-                    description=feed_data["description"],
-                    website_url=feed_data["website_url"],
-                    last_updated=datetime.utcnow(),
-                    last_checked=datetime.utcnow()
+            elif existing_feed and url in known_urls_of(existing_feed):
+                # 2. Cosmetic variant of an address this feed already moved
+                # away from: the OPML is stale for this entry
+                print(
+                    f"Skipping '{feed_data['title']}': {url} was already relocated "
+                    f"(now tracked as {existing_feed.url})"
                 )
-                db_session.add(new_feed)
-                # Commit each new feed individually to avoid transaction conflicts
+                stats["skipped"] += 1
+            elif existing_feed:
+                # 3. Same address with cosmetic differences (scheme, www,
+                # trailing slash): record the URL change on the same feed
+                old_url = existing_feed.url
+                relocate_feed(db_session, existing_feed, url, source="opml-import")
+                existing_feed.title = feed_data["title"]
+                existing_feed.description = feed_data["description"]
+                existing_feed.website_url = feed_data["website_url"]
+                apply_relocation(existing_feed, url, old_url)
                 db_session.commit()
-                new_count += 1
+            elif normalized in by_historical_url:
+                # 4. This address was already moved away from: stale OPML
+                moved_to = by_historical_url[normalized]
+                print(
+                    f"Skipping '{feed_data['title']}': {url} was already relocated "
+                    f"(now tracked as {moved_to.url})"
+                )
+                stats["skipped"] += 1
+            else:
+                # 5. Unseen URL: is this an existing feed that moved?
+                candidate = find_relocation_candidate(
+                    all_feeds, feed_data["title"], feed_data["website_url"]
+                )
+                if candidate:
+                    old_url = candidate.url
+                    relocate_feed(db_session, candidate, url, source="opml-import")
+                    candidate.title = feed_data["title"]
+                    candidate.description = feed_data["description"]
+                    candidate.website_url = feed_data["website_url"]
+                    apply_relocation(candidate, url, old_url)
+                else:
+                    # 6. Genuinely new feed
+                    new_feed = Feed(
+                        title=feed_data["title"],
+                        url=url,
+                        description=feed_data["description"],
+                        website_url=feed_data["website_url"],
+                        last_updated=datetime.utcnow(),
+                        last_checked=datetime.utcnow()
+                    )
+                    db_session.add(new_feed)
+                    all_feeds.append(new_feed)
+                    register_current(new_feed, url)
+                    stats["new"] += 1
+                db_session.commit()
         except Exception as e:
             # Roll back the transaction if there's an error
             db_session.rollback()
-            error_count += 1
+            stats["errors"] += 1
             print(f"Error importing feed {feed_data['title']}: {e}")
             # Continue with the next feed
-    
-    return new_count, updated_count
+
+    stats["relocations"] = relocations
+    return stats
 
 
 def export_feeds_to_opml(db_session: Session, include_muted: bool = True) -> str:
